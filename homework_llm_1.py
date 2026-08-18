@@ -1,79 +1,114 @@
-from collections import defaultdict
+import argparse
+import json
+import requests
+from datetime import datetime
 
-class TestLLM:
-    def __init__(self):
-        self.ngram_counts: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
-        self.train_data: list[str] = []
+def generate_scenarios(count, model="llama3.2"):
+    prompt = f"""Сгенерируй {count} тестовых сценариев для формы регистрации.
+    Сценарии должны быть как позитивные, так и негативные.
     
-    def train(self, data: list[str]) -> None:
-        """
-        Обучает модель на списке предложений.
-        Для каждого слова запоминает, какие слова встречались после него.
-        """
-        self.train_data = data
-        self.ngram_counts.clear()  # Очищаем предыдущие данные при новом обучении
-        
-        for sentence in data:
-            # Разбиваем предложение на слова
-            words = sentence.split()
-            
-            # Проходим по всем парам соседних слов
-            for i in range(len(words) - 1):
-                current_word = words[i]
-                next_word = words[i + 1]
-                # Увеличиваем счётчик для пары (current_word -> next_word)
-                self.ngram_counts[current_word][next_word] += 1
+    Форма регистрации имеет поля: имя пользователя, пароль, подтверждение пароля, кнопка "Зарегистрировать".
     
-    def predict_next_word(self, start_word: str) -> str:
-        if start_word not in self.ngram_counts:
-            return "Слово не найдено в обучающей выборке"
-        
-        next_words: defaultdict[str, int] = self.ngram_counts[start_word]
-        
-        if not next_words:
-            return "Нет данных для предсказания"
-        
-        # Находим самое частотное следующее слово
-        most_frequent: str = max(next_words, key=next_words.get)
-        
-        return most_frequent
-
-
-# Данные для обучения
-data: list[str] = [
-    "кот спит на диване",
-    "кот ест рыбу",
-    "кот играет с мячом",
-    "кот спит на окне",
-    "кот гуляет по улице",
-    "кот ест молоко",
-    "кот играет с мышкой",
-    "кот спит в коробке",
-    "кот смотрит в окно",
-    "кот гуляет в парке"
-]
-
-# Создаём и обучаем модель
-test_llm_model: TestLLM = TestLLM()
-test_llm_model.train(data)
-
-# Для тестирования
-print("=" * 50)
-print("Модель предсказания следующего слова")
-print("=" * 50)
-print("Введите слово для предсказания (или 'exit' для выхода):")
-print()
-
-while True:
-    user_input = input("> ").strip().lower()
+    Верни только JSON массив с объектами, содержащими поля:
+    id, title, type (Позитивный/Негативный), precondition, steps, expected_result, priority (High/Medium/Low)
     
-    if user_input == 'exit' or user_input == 'выход':
-        print("До свидания!")
-        break
+    Пример:
+    [
+      {{"id": "TC-001", "title": "Успешная регистрация", "type": "Позитивный", 
+        "precondition": "Форма открыта", "steps": "1. Ввести данные\\n2. Нажать кнопку", 
+        "expected_result": "Регистрация успешна", "priority": "High"}}
+    ]
+    """
     
-    if not user_input:
-        print("Пожалуйста, введите слово.\n")
-        continue
+    try:
+        response = requests.post(
+            'http://localhost:11434/api/chat',
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            },
+            timeout=60
+        )
+        content = response.json()['message']['content']
+        start = content.find('[')
+        end = content.rfind(']') + 1
+        return json.loads(content[start:end])
+    except Exception as e:
+        print(f"Ошибка при генерации: {e}")
+        return fallback_scenarios(count)
+
+def fallback_scenarios(count):
+    scenarios = [
+        {"id": "TC-001", "title": "Успешная регистрация", "type": "Позитивный",
+         "precondition": "Форма открыта", 
+         "steps": "1. Ввести имя user123\n2. Ввести пароль Pass123!\n3. Подтвердить пароль\n4. Нажать Зарегистрировать",
+         "expected_result": "Пользователь создан", "priority": "High"},
+        {"id": "TC-002", "title": "Пустое имя пользователя", "type": "Негативный",
+         "precondition": "Форма открыта",
+         "steps": "1. Оставить имя пустым\n2. Ввести пароль\n3. Подтвердить\n4. Нажать Зарегистрировать",
+         "expected_result": "Ошибка: Имя обязательно", "priority": "High"},
+        {"id": "TC-003", "title": "Пароли не совпадают", "type": "Негативный",
+         "precondition": "Форма открыта",
+         "steps": "1. Ввести имя\n2. Ввести пароль 123\n3. Подтвердить 456\n4. Нажать Зарегистрировать",
+         "expected_result": "Ошибка: Пароли не совпадают", "priority": "High"},
+        {"id": "TC-004", "title": "Короткий пароль", "type": "Негативный",
+         "precondition": "Форма открыта",
+         "steps": "1. Ввести имя\n2. Ввести пароль 123\n3. Подтвердить 123\n4. Нажать Зарегистрировать",
+         "expected_result": "Ошибка: Пароль минимум 8 символов", "priority": "High"},
+        {"id": "TC-005", "title": "Существующий пользователь", "type": "Негативный",
+         "precondition": "Пользователь test уже существует",
+         "steps": "1. Ввести имя test\n2. Ввести пароль\n3. Подтвердить\n4. Нажать Зарегистрировать",
+         "expected_result": "Ошибка: Пользователь уже существует", "priority": "Medium"}
+    ]
+    return scenarios[:count]
+
+def save_markdown(scenarios, filename="scenarios.md"):
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(f"# Тестовые сценарии для формы регистрации\n\n")
+        f.write(f"**Дата:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        f.write(f"**Всего сценариев:** {len(scenarios)}\n\n---\n\n")
+        
+        for s in scenarios:
+            f.write(f"## {s['id']}: {s['title']}\n\n")
+            f.write(f"**Тип:** {s['type']}\n")
+            f.write(f"**Приоритет:** {s.get('priority', 'Medium')}\n\n")
+            f.write(f"**Предусловия:**\n{s['precondition']}\n\n")
+            f.write(f"**Шаги:**\n{s['steps']}\n\n")
+            f.write(f"**Ожидаемый результат:**\n{s['expected_result']}\n\n---\n\n")
+        
+        pos = sum(1 for s in scenarios if "позитив" in s['type'].lower())
+        neg = len(scenarios) - pos
+        f.write(f"## Статистика\n\n")
+        f.write(f"- **Позитивные сценарии:** {pos}\n")
+        f.write(f"- **Негативные сценарии:** {neg}\n")
+        f.write(f"- **Всего:** {len(scenarios)}\n")
+
+def main():
+    parser = argparse.ArgumentParser(description="Генератор тестовых сценариев")
+    parser.add_argument("count", type=int, nargs="?", default=5, help="Количество сценариев")
+    parser.add_argument("-m", "--model", default="llama3.2", help="Модель Ollama")
+    parser.add_argument("-o", "--output", default="scenarios.md", help="Выходной файл")
+    args = parser.parse_args()
     
-    prediction = test_llm_model.predict_next_word(user_input)
-    print(f"Предсказанное следующее слово: '{prediction}'\n")
+    print(f"🤖 Генерация {args.count} тестовых сценариев...")
+    print(f"📦 Модель: {args.model}")
+    
+    # Проверяем доступность Ollama
+    try:
+        requests.get('http://localhost:11434/api/tags', timeout=2)
+        print("✅ Ollama запущен и доступен")
+    except:
+        print("⚠️ Ollama не доступен, будут использованы резервные сценарии")
+    
+    scenarios = generate_scenarios(args.count, args.model)
+    save_markdown(scenarios, args.output)
+    
+    pos = sum(1 for s in scenarios if "позитив" in s['type'].lower())
+    neg = len(scenarios) - pos
+    
+    print(f"\n✅ Сценарии сохранены в {args.output}")
+    print(f"📊 Статистика: Позитивных: {pos}, Негативных: {neg}, Всего: {len(scenarios)}")
+
+if __name__ == "__main__":
+    main()
