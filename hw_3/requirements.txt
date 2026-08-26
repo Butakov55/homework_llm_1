@@ -1,0 +1,5 @@
+pytest==7.4.0
+requests==2.31.0
+ollama==0.1.5
+pytest-html==4.0.1
+pytest-xdist==3.3.1

@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_HOST=0.0.0.0
+    command: serve
+    restart: unless-stopped
+
+  test-generator:
+    build: .
+    container_name: test-generator
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./tests:/app/tests
+      - ./prompts:/app/prompts
+      - ./scripts:/app/scripts
+    command: python -c "print('✅ Test generator container is ready')"
+
+volumes:
+  ollama_data:
