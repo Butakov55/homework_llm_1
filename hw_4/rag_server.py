@@ -4,15 +4,15 @@ RAG-генерация ответов по документации управл
 с использованием локальной модели Ollama.
 
 Логика:
-1. Локальный датасет (документация) разбивается на чанки.
+1. Локальный датасет (документация) разбивается на чанки по строкам.
 2. Для запроса пользователя считается косинусная близость эмбеддингов
    (модель эмбеддингов Ollama, например `nomic-embed-text`).
+   Дополнительно добавляется бонус за лексическое совпадение слов
+   (гибридный поиск) — это критично для маленькой базы.
 3. Топ-K релевантных чанков подаются в промпт-контекст.
 4. Генерация ответа выполняется локальной LLM через Ollama.
 """
 
-import sys
-import json
 import math
 from typing import List, Tuple
 
@@ -21,8 +21,8 @@ import requests
 # ------------------------- Конфигурация -------------------------
 OLLAMA_HOST = "http://localhost:11434"
 EMBED_MODEL = "nomic-embed-text"   # ollama pull nomic-embed-text
-LLM_MODEL = "qwen2.5"             # ollama pull llama3.2  (или mistral, qwen2.5 и т.п.)
-TOP_K = 3
+LLM_MODEL = "qwen2.5"              # ollama pull qwen2.5  (или llama3.2, mistral и т.п.)
+TOP_K = 2
 
 # ------------------------- Локальный датасет (документация) -------------------------
 DOCUMENT = """
@@ -39,10 +39,7 @@ DOCUMENT = """
 
 
 def split_into_chunks(text: str) -> List[str]:
-    """Разбиваем документацию на отдельные смысловые чанки (по предложениям)."""
-    # Разбиение по точке с сохранением смысла — просто и надёжно для короткой инструкции
-    raw = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-    return [s + "." for s in raw]
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 # ------------------------- Ollama API -------------------------
@@ -61,14 +58,14 @@ def ollama_embeddings(texts: List[str], model: str = EMBED_MODEL) -> List[List[f
 
 
 def ollama_generate(prompt: str, model: str = LLM_MODEL) -> str:
-    """Генерация ответа через /api/generate (стриминг отключён)."""
+    """Генерация ответа через /api/generate (без стриминга)."""
     resp = requests.post(
         f"{OLLAMA_HOST}/api/generate",
         json={
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.0},
         },
         timeout=300,
     )
@@ -84,6 +81,27 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (na * nb + 1e-12)
 
 
+def lexical_hits(query_words: List[str], chunk_text: str) -> int:
+    """Грубый стемминг: считаем совпадения по первым 5 символам слова.
+
+    «запустить» -> «запус» совпадёт с «запуска»
+    «сервер»    -> «серве» совпадёт с «сервера»
+    """
+    chunk_words = (
+        chunk_text.lower()
+        .replace(".", " ")
+        .replace(",", " ")
+        .replace(":", " ")
+        .split()
+    )
+    hits = 0
+    for qw in query_words:
+        stem = qw[:5]
+        if any(cw.startswith(stem) for cw in chunk_words):
+            hits += 1
+    return hits
+
+
 class Retriever:
     def __init__(self, chunks: List[str]):
         self.chunks = chunks
@@ -91,25 +109,33 @@ class Retriever:
 
     def retrieve(self, query: str, k: int = TOP_K) -> List[Tuple[str, float]]:
         q_vec = ollama_embeddings([query])[0]
-        scored = [
-            (chunk, cosine_similarity(q_vec, vec))
-            for chunk, vec in zip(self.chunks, self.chunk_vectors)
+        q_words = [
+            w for w in query.lower().replace("?", "").replace(",", "").split()
+            if len(w) >= 4
         ]
+
+        scored: List[Tuple[str, float]] = []
+        for chunk, vec in zip(self.chunks, self.chunk_vectors):
+            sim = cosine_similarity(q_vec, vec)
+            bonus = 0.5 * lexical_hits(q_words, chunk)
+            scored.append((chunk, sim + bonus))
+
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:k]
 
 
 # ------------------------- RAG -------------------------
-PROMPT_TEMPLATE = """Ты — ассистент, который отвечает на вопросы строго по документации.
-Используй только предоставленный контекст. Если ответа в контексте нет — скажи,
-что информации в документации нет. Не выдумывай команды.
+PROMPT_TEMPLATE = """Ты — ассистент техподдержки. Отвечай ТОЛЬКО на основе контекста ниже.
+Категорически запрещено использовать знания вне контекста.
+Если в контексте есть команда — процитируй её ДОСЛОВНО, не меняя ни одного символа.
+Если ответа нет в контексте — ответь: "В документации нет информации по этому вопросу."
 
 Контекст:
 {context}
 
-Вопрос пользователя: {question}
+Вопрос: {question}
 
-Ответ:"""
+Дословный ответ из контекста:"""
 
 
 def build_prompt(question: str, retrieved: List[Tuple[str, float]]) -> str:
@@ -117,8 +143,13 @@ def build_prompt(question: str, retrieved: List[Tuple[str, float]]) -> str:
     return PROMPT_TEMPLATE.format(context=context, question=question)
 
 
-def answer(question: str, retriever: Retriever) -> str:
+def answer(question: str, retriever: Retriever, debug: bool = True) -> str:
     retrieved = retriever.retrieve(question, TOP_K)
+    if debug:
+        print("\n--- DEBUG: топ чанков ---")
+        for c, s in retrieved:
+            print(f"[{s:.3f}] {c}")
+        print("-------------------------\n")
     prompt = build_prompt(question, retrieved)
     return ollama_generate(prompt)
 
@@ -127,6 +158,12 @@ def answer(question: str, retriever: Retriever) -> str:
 def main():
     print("Инициализация RAG (индексация документации)...")
     chunks = split_into_chunks(DOCUMENT)
+
+    print("\n=== ЧАНКИ В ИНДЕКСЕ ===")
+    for i, c in enumerate(chunks):
+        print(f"{i}: [{c}]")
+    print("=======================\n")
+
     retriever = Retriever(chunks)
     print(f"Готово. Чанков в индексе: {len(chunks)}")
     print("Введите вопрос (или 'exit' для выхода).\n")
