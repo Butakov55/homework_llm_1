@@ -11,7 +11,7 @@ import sys
 
 def wait_for_ollama():
     """Ожидание готовности Ollama"""
-    url = "http://localhost:11434/api/generate"
+    url = "http://ollama:11434/api/generate"
     max_attempts = 30
     attempt = 0
     
@@ -60,7 +60,7 @@ def generate_tests():
     
     # Отправляем запрос к Ollama
     try:
-        response = requests.post('http://localhost:11434/api/generate', json={
+        response = requests.post('http://ollama:11434/api/generate', json={
             "model": "codellama:7b-code",
             "prompt": prompt,
             "stream": False,
